@@ -1,269 +1,399 @@
-# IW.SIM Part06 - PLC Runtime Architecture Design
+# IW.SIM Part06 PLC Runtime 架构设计
 
-## 1. PLC Runtime Overview
+## 1. PLC Runtime 在 IW.SIM 中的定位
 
-PLC Runtime 是 IW.SIM 工业仿真平台中负责控制器行为仿真的核心运行时，用于在无真实 PLC 或与真实 PLC 并行运行的情况下，复现工业控制系统的扫描周期、变量刷新、逻辑执行、通信交互和故障行为。
+PLC Runtime 是 IW.SIM 工业机电控一体化仿真平台中用于复现工业控制器行为的核心运行模块。
 
-PLC Runtime 不等同于简单 PLC 数据模拟器，而是一个面向工业控制语义的可确定性执行环境。
+它不是简单的数据模拟器，而是在仿真环境中复现真实 PLC 控制系统的运行语义，包括：
 
-核心职责：
+- 周期扫描机制
+- 输入采集
+- 用户程序执行
+- 输出刷新
+- 通讯处理
+- 诊断报警
+- 故障注入
+- 与现场设备闭环控制
 
-- PLC 扫描周期调度
-- 输入镜像区刷新
-- 用户逻辑执行
-- 输出镜像区更新
-- 通信变量同步
-- 状态诊断与故障注入
-- 与 Device Runtime 联动
-
-## 2. Runtime Architecture
-
-PLC Runtime 分为以下层次：
+在实际立库项目中，WCS、PLC、设备之间形成如下控制链路：
 
 ```
-PLC Runtime Host
- ├── Scan Scheduler
- ├── Process Image Manager
- │    ├── Input Image
- │    └── Output Image
- ├── Logic Execution Engine
- │    ├── Ladder Runtime
- │    ├── Function Block Runtime
- │    └── Custom Logic Runtime
- ├── Communication Adapter
- ├── Diagnostic Manager
- └── Simulation Event Adapter
+WCS
+ ↓
+PLC Runtime
+ ↓
+Signal Runtime
+ ↓
+Device Runtime
+ ↓
+World Model
+ ↓
+Sensor Feedback
+ ↓
+PLC Runtime
 ```
 
-## 3. PLC Scan Cycle Model
+IW.SIM 的目标不是模拟 PLC 界面，而是模拟 PLC 对自动化系统产生的控制行为。
 
-工业 PLC 的核心模型是周期扫描：
+---
 
-```
-Input Refresh
-      ↓
-Program Execute
-      ↓
-Output Update
-      ↓
-Communication Service
-      ↓
-Next Cycle
-```
+# 2. PLC Runtime 总体架构
 
-IW.SIM 中通过 Simulation Kernel 提供统一 SimTime，PLC Runtime 不直接依赖系统时间。
-
-```csharp
-public interface IPlcRuntime
-{
-    void Scan(SimTime time);
-    PlcState State { get; }
-}
-```
-
-## 4. Process Image Design
-
-PLC Runtime 使用过程映像区模型隔离设备实时状态与控制逻辑。
+PLC Runtime 采用运行时内核 + 协议适配 + 控制逻辑插件架构。
 
 ```
-Physical Device
-       |
-Signal Mapping
-       |
-Input Image
-       |
-PLC Logic
-       |
-Output Image
-       |
-Device Command
+                 PLC Runtime Host
+                       |
+        --------------------------------
+        |              |               |
+ Scan Scheduler   Memory Model   Logic Engine
+        |              |               |
+        |        Process Image     FB Runtime
+        |        Tag Database      Ladder Runtime
+        |                            Motion FB
+        |
+ Communication Runtime
+        |
+ S7 / OPC UA / TCP / Modbus
 ```
+
+核心模块：
+
+## 2.1 PLC Runtime Host
+
+负责 PLC 实例生命周期管理：
+
+- 创建 PLC
+- 加载配置
+- 启停运行
+- 周期调度
+- 状态管理
+
+## 2.2 Scan Scheduler
+
+负责模拟真实 PLC 扫描周期。
+
+典型周期：
+
+- 快速任务：1~10ms
+- 普通任务：20~50ms
+- 慢速任务：100ms+
+
+仿真中所有周期基于 Simulation Kernel 提供的 SimTime，而不是操作系统时间。
+
+---
+
+# 3. PLC 扫描周期模型
+
+真实 PLC 扫描过程：
+
+```
+输入刷新
+   ↓
+程序执行
+   ↓
+输出刷新
+   ↓
+通信服务
+   ↓
+下一扫描周期
+```
+
+IW.SIM 内部实现：
+
+```
+SimTime Tick
+      |
+PLC Scheduler
+      |
+Input Snapshot
+      |
+Logic Execute
+      |
+Output Commit
+      |
+Event Publish
+```
+
+这样保证：
+
+- 仿真暂停后可以继续
+- 快进运行可重复
+- 自动测试结果一致
+
+---
+
+# 4. PLC 内存模型设计
+
+PLC Runtime 需要模拟工业 PLC 地址空间。
 
 支持：
 
-- Bool
-- Byte
-- Word
-- DWord
-- Int
-- Real
-- String
-- Structure
+- I 区（输入）
+- Q 区（输出）
+- M 区（内部变量）
+- DB 数据块
+- Symbol Tag
 
-## 5. PLC Variable Model
+模型：
 
-PLC Tag 是控制系统中的核心数据对象。
+```
+PlcMemory
+ |
+ +-- InputArea
+ |
+ +-- OutputArea
+ |
+ +-- MarkerArea
+ |
+ +-- DataBlockArea
+```
+
+示例：
 
 ```csharp
-public class PlcVariable
+public class PlcTag
 {
     public string Address {get;set;}
-    public PlcDataType Type {get;set;}
+    public string Symbol {get;set;}
+    public PlcDataType DataType {get;set;}
     public object Value {get;set;}
-    public DateTime SimTimestamp {get;set;}
 }
 ```
 
-支持地址：
+---
 
-- I/O 地址
-- DB 地址
-- Marker 地址
-- Memory 地址
-- Symbol 地址
+# 5. Process Image 过程映像设计
 
-## 6. Logic Execution Engine
+为了模拟 PLC 扫描一致性，引入过程映像。
 
-逻辑执行引擎采用插件化设计。
+```
+现场设备
+ ↓
+Input Mapping
+ ↓
+Input Image
+ ↓
+PLC Logic
+ ↓
+Output Image
+ ↓
+Command Mapping
+ ↓
+设备
+```
+
+优势：
+
+- 避免逻辑执行过程中数据变化
+- 与真实 PLC 行为一致
+- 支持扫描回放
+
+---
+
+# 6. PLC Logic Runtime
+
+控制逻辑执行采用插件模型。
+
+## 6.1 梯形图 Runtime
+
+用于兼容传统自动化项目。
 
 支持：
 
-### Ladder Runtime
+- 常开/常闭触点
+- 线圈
+- 定时器
+- 计数器
 
-用于复现传统 PLC 梯形图逻辑。
+## 6.2 Function Block Runtime
 
-### Function Block Runtime
-
-支持：
+支持工业控制功能块：
 
 - TON
 - TOF
 - CTU
 - PID
-- Motion FB
+- Motion Control FB
 
-### Custom Runtime
+## 6.3 自定义逻辑 Runtime
 
-允许使用 C# 编写仿真控制逻辑。
+允许使用 C# 编写特殊控制逻辑。
 
-## 7. PLC Communication Layer
+例如：
 
-PLC Runtime 提供工业协议适配：
+- 复杂输送逻辑
+- 特殊设备控制
+- 项目快速验证
 
-```
-Communication Runtime
-        |
- ┌───────────────┐
- │ S7 Adapter    │
- │ OPC UA        │
- │ Modbus        │
- │ Custom TCP    │
- └───────────────┘
-```
+---
 
-用于支持：
+# 7. PLC 与设备闭环模型
 
-- WCS 联调
-- TIA Portal 联调
-- 真实 PLC HIL
+以输送机为例：
 
-## 8. Device Runtime Integration
-
-PLC Runtime 与 Device Runtime 通过 Signal / Command Event 交互。
-
-控制链路：
+PLC 输出：
 
 ```
-PLC Output
-    ↓
-Signal Runtime
-    ↓
-Device Command
-    ↓
-Device Runtime
-    ↓
-World State Update
+Motor_Start = TRUE
+Speed_Set = 0.8m/s
 ```
 
-状态反馈：
+Signal Runtime 转换：
 
 ```
-Device State
-    ↓
-Sensor Signal
-    ↓
-PLC Input Image
-    ↓
-PLC Logic
+Q100.0
+ ↓
+MotorCommand
 ```
 
-## 9. Deterministic Execution
+Device Runtime 执行：
 
-为了保证仿真可重复：
+```
+Conveyor.Move()
+```
 
-- 禁止直接使用 DateTime.Now
-- 所有时间来自 SimClock
-- 固定 Scan Cycle
-- Event Queue 顺序确定
+设备反馈：
+
+```
+Cargo Position
+Sensor State
+Motor Feedback
+```
+
+重新进入 PLC 输入区。
+
+形成完整闭环。
+
+---
+
+# 8. PLC 通信仿真
+
+支持真实工程联调：
+
+## Siemens S7
 
 支持：
 
-- 回放测试
-- 自动化测试
-- 故障复现
+- S7 TCP
+- DB 数据访问
+- Snap7 兼容
+- TIA Portal 联调
 
-## 10. Multi PLC Architecture
+## OPC UA
 
-大型立库通常包含多个 PLC。
+用于数字化系统集成。
 
-IW.SIM 支持：
+## 自定义协议
+
+支持项目现场私有 PLC 通讯协议。
+
+---
+
+# 9. 多 PLC 仿真架构
+
+大型智能仓库通常存在：
+
+- 输送 PLC
+- 堆垛机 PLC
+- RGV PLC
+- 提升机 PLC
+
+IW.SIM 支持多个独立 PLC Runtime：
 
 ```
 Simulation Kernel
+ |
+ +-- PLC-01
+ |      |
+ |      Conveyor
+ |
+ +-- PLC-02
+ |      |
+ |      Stacker Crane
+ |
+ +-- PLC-03
         |
- -----------------
- |       |        |
-PLC-01 PLC-02 PLC-03
- |       |        |
-Device Device Device
+        RGV
 ```
 
-每个 PLC 拥有：
+每个 PLC：
 
-- 独立扫描周期
 - 独立变量空间
-- 独立通信通道
+- 独立扫描周期
+- 独立通信连接
 
-## 11. Engineering Implementation (.NET)
+---
 
-推荐工程结构：
+# 10. 与 Simulation Kernel 集成
+
+PLC Runtime 不拥有时间。
+
+时间由 Simulation Kernel 管理：
+
+```
+Simulation Clock
+       |
+Event Scheduler
+       |
+PLC Scan Event
+       |
+PLC Runtime Execute
+```
+
+保证确定性。
+
+---
+
+# 11. .NET 10 工程实现建议
+
+推荐结构：
 
 ```
 src
- ├── IW.Sim.Plc.Runtime
- ├── IW.Sim.Plc.Protocol
- ├── IW.Sim.Plc.Logic
- ├── IW.Sim.Plc.Model
- └── IW.Sim.Plc.Test
+ |
+ +-- IW.Sim.Plc.Runtime
+ |
+ +-- IW.Sim.Plc.Memory
+ |
+ +-- IW.Sim.Plc.Logic
+ |
+ +-- IW.Sim.Plc.Protocol
+ |
+ +-- IW.Sim.Plc.Adapter
+ |
+ +-- IW.Sim.Plc.Test
 ```
 
 核心接口：
 
 ```csharp
-public interface IPlcScanEngine
+public interface IPlcRuntime
 {
-    Task ExecuteCycleAsync(SimTime time);
+    void ExecuteCycle(SimTime time);
 }
 ```
 
-## 12. Relationship With Other Modules
+---
 
-| Module | Responsibility |
+# 12. 与其他模块关系
+
+|模块|职责|
 |-|-|
-| World Model | 世界状态 |
-| Simulation Kernel | 时间与事件调度 |
-| PLC Runtime | 控制逻辑 |
-| Signal Runtime | 信号交换 |
-| Device Runtime | 设备行为 |
-| HIL Runtime | 外部控制器接入 |
+|World Model|工业世界状态|
+|Simulation Kernel|时间与事件|
+|PLC Runtime|控制逻辑|
+|Signal Runtime|信号转换|
+|Device Runtime|设备行为|
+|HIL Runtime|真实控制器接入|
 
-## 13. Future Extension
+---
 
-后续支持：
+# 13. 后续演进方向
 
 - TIA Portal 工程解析
-- S7 PLC Binary Runtime
+- 自动生成 PLC Tag
 - IEC61131-3 Runtime
 - Soft PLC
-- PLC AI Debug Assistant
-- 自动生成测试场景
+- AI PLC 调试助手
+- 自动生成控制测试案例
