@@ -1,286 +1,67 @@
 # IW.SIM Part07 Signal IO Runtime 架构设计
 
-## 1. Signal IO Runtime 定位
+Signal IO Runtime 是设备模型、PLC 过程映像和 HIL 信号契约之间的唯一逻辑信号边界。原有职责保持不变，但本版本补充周期提交、质量传播、版本 Hash 和 HIL 接入约束。
 
-Signal IO Runtime 是 IW.SIM 工业机电控一体化仿真平台中的现场信号抽象层，负责连接控制系统与设备模型。
+## 1. 核心链路
 
-它不是简单的 IO 点表管理，而是模拟工业现场从传感器、执行器、电气信号到 PLC 地址空间之间的完整数据链路。
-
-核心职责：
-
-- 数字量输入输出管理
-- 模拟量采集与输出
-- 信号状态转换
-- PLC 地址映射
-- 设备事件转换
-- 信号诊断
-- 故障注入
-
-典型链路：
-
-```
-Device Runtime
-      |
-Sensor / Actuator
-      |
-Signal IO Runtime
-      |
-PLC Process Image
-      |
-PLC Logic
+```text
+Device Runtime -> Signal IO -> Input Staging -> InputCommit -> PLC Input Image
+PLC Output Image -> OutputCommit -> Signal IO -> Device Runtime / HIL
 ```
 
----
-
-# 2. Signal IO 总体架构
-
-```
-Signal Runtime Host
- |
- +-- Signal Manager
- |
- +-- Mapping Engine
- |
- +-- Digital IO Runtime
- |
- +-- Analog IO Runtime
- |
- +-- Signal Filter
- |
- +-- Diagnostic Service
- |
- +-- Protocol Adapter
-```
-
----
-
-# 3. 信号模型设计
-
-IW.SIM 中所有现场信号统一抽象为 Signal。
+## 2. 规范化信号模型
 
 ```csharp
-public class Signal
+public sealed record SignalValue(
+    string SignalId,
+    PlcDataType DataType,
+    ReadOnlyMemory<byte> RawValue,
+    SignalQuality Quality,
+    long SourceSequence,
+    long SimTick);
+
+public interface ISignalIoRuntime
 {
-    public string Id {get;set;}
-    public SignalType Type {get;set;}
-    public object Value {get;set;}
-    public SignalState State {get;set;}
+    void StageInput(SignalValue value);
+    void StageOutput(SignalValue value);
+    InputImageCommit CommitInputs(long simTick);
+    OutputImageCommit CommitOutputs(long simTick);
 }
 ```
 
-支持：
+禁止使用 `object Value` 作为跨模块契约；协议适配器负责字节到类型的转换，Signal IO 负责业务信号语义和映射校验。
 
-- Bool
-- Int
-- Real
-- String
-- Enum
-- Structure
+## 3. 质量与安全规则
 
----
+- `Good`：允许进入 PLC 输入映像。
+- `Uncertain`：允许进入普通逻辑，但不得驱动 Critical Output。
+- `Bad`：输入仍可审计，但默认不覆盖上一有效值；安全策略可强制置位。
+- Critical Output 必须声明 `FailSafeValue`、`AckRequired`、`AckTimeoutTicks`。
 
-# 4. 数字量 IO 模型
+## 4. 映射与版本
 
-典型工业信号：
+每个映射包含 `SignalId、PlcId、Address、Direction、DataType、ContractVersion、MappingHash`。配置加载阶段执行地址重叠、类型长度、方向和唯一性校验；失败不得启动 PLC Runtime。
 
-输入：
+## 5. 周期一致性
 
-- 光电传感器
-- 接近开关
-- 门禁信号
-- 原点信号
+`StageInput -> InputCommit -> Plc Logic -> OutputCommit` 必须在 Part06 扫描周期内按固定顺序执行。HIL 输入先写入 Part10 InputRecord，再在目标 `SimTick` 的 TickBoundary 注入；HIL 输出只能消费已提交 Output Image。
 
-输出：
+## 6. 故障处理
 
-- 电机启动
-- 电磁阀
-- 报警灯
+|错误码|条件|处理|
+|-|-|-|
+|IO-RT-001|映射 Hash 不一致|Session 保持 Handshaking|
+|IO-RT-002|地址冲突|拒绝加载配置|
+|IO-RT-003|Quality=Bad 的关键输入|触发安全策略并发布事件|
+|IO-RT-004|Output Commit Hash 不一致|保留上一输出并进入 Degraded|
 
-模型：
+## 7. 验收项
 
-```
-Sensor
- |
-Digital Input
- |
-PLC I Address
-```
+1. 同一 SimTick 内 Signal 更新不会影响已开始的 PLC Logic。
+2. 映射修改会生成新 ContractVersion 和 MappingHash。
+3. 重复 `ExternalSequence` 不得产生第二个 SignalValue。
+4. 旧 ClockEpoch 信号不得覆盖当前输入映像。
+5. OutputCommit 失败时设备保持上一有效命令。
+6. 100 个 PLC 并发提交时不存在 SignalId/PlcId 串线。
 
----
-
-# 5. 模拟量 IO 模型
-
-支持：
-
-- 速度给定
-- 温度
-- 压力
-- 位移
-
-提供：
-
-- 原始值
-- 工程值转换
-- 量程校准
-- 滤波
-
-例如：
-
-```
-0-27648
-    |
-Scaling
-    |
-0-10m/s
-```
-
----
-
-# 6. IO Mapping 设计
-
-针对立库项目，支持 Excel IO Mapping 导入。
-
-映射关系：
-
-```
-设备信号
-   |
-Signal Mapping
-   |
-PLC Address
-```
-
-示例：
-
-```
-Conveyor01.Sensor01
-        |
-        I0.0
-```
-
-支持：
-
-- 地址映射
-- Symbol 映射
-- 多 PLC 映射
-- 版本管理
-
----
-
-# 7. Signal 生命周期
-
-```
-Create
-  |
-Bind Device
-  |
-Mapping
-  |
-Runtime Update
-  |
-Publish Event
-  |
-Diagnostic
-```
-
----
-
-# 8. 与 Device Runtime 集成
-
-设备产生状态：
-
-```
-Cargo Position
-Motor State
-Sensor Trigger
-```
-
-转换为：
-
-```
-Device Event
-      |
-Signal Runtime
-      |
-PLC Input
-```
-
-PLC 输出：
-
-```
-Q0.0 = TRUE
-      |
-Signal Runtime
-      |
-Motor Command
-      |
-Device Runtime
-```
-
-形成闭环控制。
-
----
-
-# 9. 故障注入
-
-支持工业测试场景：
-
-- 传感器失效
-- 信号抖动
-- 延迟响应
-- 常开故障
-- 常闭故障
-- 通讯断开
-
-示例：
-
-```
-Sensor Fault
-      |
-Signal Override
-      |
-PLC Behavior Test
-```
-
----
-
-# 10. .NET 工程结构
-
-```
-IW.Sim.Signal.Runtime
-IW.Sim.Signal.Model
-IW.Sim.Signal.Mapping
-IW.Sim.Signal.Protocol
-IW.Sim.Signal.Test
-```
-
-核心接口：
-
-```csharp
-public interface ISignalRuntime
-{
-    void Update(SimTime time);
-}
-```
-
----
-
-# 11. 与其他模块关系
-
-|模块|职责|
-|-|-|
-|World Model|对象状态|
-|Device Runtime|设备行为|
-|Signal IO Runtime|现场信号|
-|PLC Runtime|控制逻辑|
-|Simulation Kernel|时间调度|
-
----
-
-# 12. 后续演进
-
-- TIA Portal IO 自动解析
-- PLC 地址自动生成
-- 电气回路仿真
-- Safety IO 仿真
-- AI 辅助 IO 调试
+详见：`docs/IW.SIM/07-Signal-IO-HIL-Contract.md`、`docs/IW.SIM/06-PLC-Process-Image-Design.md`。
