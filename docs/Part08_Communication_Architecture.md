@@ -1,274 +1,83 @@
 # IW.SIM Part08 通信架构设计
 
-## 1. 通信架构定位
+通信 Runtime 负责通道、协议、连接状态和消息传输；业务信号语义由 Signal IO Runtime 管理，PLC 扫描由 PLC Runtime 管理，仿真时间由 Simulation Kernel 管理。
 
-在工业自动化仿真系统中，通信不是简单的数据传输，而是连接 WCS、PLC、设备控制器、现场协议和外部系统的工业网络运行环境。
+## 1. 三层模型
 
-IW.SIM 通信架构负责模拟真实项目中的通信行为，包括：
-
-- PLC 与 WCS 通信
-- PLC 与设备控制器通信
-- 现场工业协议模拟
-- 网络延迟与异常模拟
-- 通信状态管理
-- HIL 外部设备接入
-
-整体链路：
-
-```
-WCS
- |
+```text
 Communication Runtime
- |
-PLC Runtime
- |
-Signal Runtime
- |
-Device Runtime
- |
-World Model
+  -> Channel Layer: byte stream / connection
+  -> Protocol Adapter: framing / codec / ack
+  -> Integration Port: HilSignalFrame / WCS message
 ```
 
----
+协议适配器不得直接依赖 World Model、Device Runtime、EF Core 或 Simulation Kernel 内部实现。
 
-# 2. 通信总体架构
-
-采用 Adapter + Channel + Protocol 三层模型。
-
-```
-Communication Runtime
-        |
-+----------------+
-| Channel Layer  |
-+----------------+
-        |
-+----------------+
-| Protocol Layer |
-+----------------+
-        |
-+----------------+
-| Adapter Layer  |
-+----------------+
-```
-
-核心职责：
-
-- 建立连接
-- 数据编码解码
-- 消息路由
-- 状态监控
-- 异常处理
-
----
-
-# 3. Channel 通道模型
-
-通信通道抽象真实工业连接。
-
-支持：
-
-- TCP Channel
-- UDP Channel
-- Serial Channel
-- Shared Memory Channel
-- Virtual Channel
-
-模型：
+## 2. 规范化接口
 
 ```csharp
-public interface ICommunicationChannel
+public interface ICommunicationChannel : IAsyncDisposable
 {
-    Task SendAsync(byte[] data);
-    Task<byte[]> ReceiveAsync();
-    ConnectionState State {get;}
+    ConnectionState State { get; }
+    ValueTask OpenAsync(CancellationToken ct);
+    ValueTask SendAsync(ReadOnlyMemory<byte> data, CancellationToken ct);
+    IAsyncEnumerable<ReadOnlyMemory<byte>> ReadFramesAsync(CancellationToken ct);
 }
-```
 
----
-
-# 4. 协议适配模型
-
-IW.SIM 不绑定单一协议，通过协议插件扩展。
-
-支持：
-
-## Siemens S7
-
-用于 PLC 联调：
-
-- S7 TCP
-- DB 数据访问
-- Snap7 兼容
-
-## OPC UA
-
-用于数字化系统集成。
-
-## Modbus TCP
-
-用于标准设备通信。
-
-## 自定义 TCP 协议
-
-支持现场设备私有协议。
-
----
-
-# 5. S7 通信仿真设计
-
-针对立库项目，S7 是核心协议。
-
-结构：
-
-```
-External PLC
-      |
- S7 Client
-      |
- IW.SIM S7 Server
-      |
- PLC Memory Model
-```
-
-S7 Server 映射：
-
-```
-DB Area
- |
-PlcTag
- |
-Signal Mapping
- |
-Device State
-```
-
-支持：
-
-- DB 读写
-- I/Q 区映射
-- 地址转换
-- 数据一致性
-
----
-
-# 6. WCS 通信模型
-
-WCS 联调是 IW.SIM 核心场景。
-
-支持：
-
-```
-WCS
- |
-Task Command
- |
-Communication Runtime
- |
-PLC Runtime
- |
-Equipment
-```
-
-包括：
-
-- 任务下发
-- 状态反馈
-- 心跳
-- 报警
-- 完成通知
-
----
-
-# 7. 通信异常仿真
-
-为了接近现场环境，支持：
-
-- 网络延迟
-- 丢包
-- 重连
-- 超时
-- 数据错误
-- 服务不可用
-
-模型：
-
-```
-Message
- |
-Fault Simulator
- |
-Network Condition
- |
-Receiver
-```
-
----
-
-# 8. 与 Simulation Kernel 集成
-
-通信事件由仿真时间驱动。
-
-```
-Simulation Clock
-       |
-Communication Event
-       |
-Message Queue
-       |
-Protocol Handler
-```
-
-保证：
-
-- 可暂停
-- 可快进
-- 可回放
-- 可测试
-
----
-
-# 9. .NET 工程结构
-
-推荐：
-
-```
-IW.Sim.Communication.Runtime
-IW.Sim.Communication.Channel
-IW.Sim.Communication.Protocol
-IW.Sim.Communication.S7
-IW.Sim.Communication.OpcUa
-IW.Sim.Communication.Test
-```
-
-核心接口：
-
-```csharp
 public interface IProtocolAdapter
 {
-    Task HandleAsync(MessageContext context);
+    ProtocolId Protocol { get; }
+    ValueTask<HandshakeResult> HandshakeAsync(HandshakeRequest request, CancellationToken ct);
+    ValueTask<DecodeResult> DecodeAsync(ReadOnlyMemory<byte> frame, CancellationToken ct);
+    ValueTask<EncodeResult> EncodeAsync(HilSignalFrame message, CancellationToken ct);
 }
 ```
 
----
+## 3. 连接和故障状态
 
-# 10. 与其他模块关系
+`Created -> Connecting -> Handshaking -> Ready -> Degraded -> Reconnecting -> Failed/Disposed`。重连必须创建新的 `ClockEpoch`；旧 Epoch 的业务帧不得路由到 Signal IO。
 
-|模块|职责|
-|-|-|
-|Simulation Kernel|时间调度|
-|Communication Runtime|通信行为|
-|PLC Runtime|控制逻辑|
-|Signal Runtime|信号转换|
-|Device Runtime|设备执行|
-|WCS|业务调度|
+## 4. 消息处理管线
 
----
+```text
+Receive bytes
+ -> frame reassembly
+ -> protocol checksum/version validation
+ -> decode
+ -> attach TransportSequence/ExternalSequence/ClockEpoch
+ -> HIL Session validation
+ -> Part10 InputRecord
+```
 
-# 11. 后续演进
+发送管线：
 
-- TIA Portal 在线联调
-- OPC UA Server
-- MQTT 工业物联网接入
-- 网络拓扑仿真
-- 通信性能分析
-- AI 自动诊断通信异常
+```text
+OutputCommit
+ -> SafetyGuard
+ -> protocol encode
+ -> channel send
+ -> Ack tracker
+ -> timeout/fault event
+```
+
+## 5. 背压规则
+
+每个 Channel 的接收和发送队列必须有界。遥测/非关键帧可丢弃并计数；Critical 输入或安全输出不得静默丢弃，必须触发 `COM-ADP-007` 或进入安全态。协议线程禁止同步等待数据库或 Kernel 主循环。
+
+## 6. 与 Part06/Part07/Part12 的一致性修复
+
+- Part06 仅消费 Process Image，不读取原始协议帧。
+- Part07 仅消费规范化 SignalValue，不承担 TCP 重连。
+- Part12 HIL Session 负责 Epoch、契约版本和对账，不重新实现协议编解码。
+- Part10 负责 InputRecord/Event/Replay 事实链，Communication 不得直接写 World State。
+
+## 7. 验收项
+
+1. 半包/粘包重组后业务帧数量正确且无重复。
+2. MappingHash 不一致时 Session 不能进入 Ready。
+3. 重连后旧 Epoch 帧全部拒收。
+4. 协议错误只隔离错误帧，达到阈值才重连。
+5. Critical 输出 Ack 超时可观测并触发安全策略。
+6. 网络延迟变化不改变 Replay 结果 Hash。
+
+详见：`docs/IW.SIM/08-Protocol-Adapter-State-Machine.md`、`docs/IW.SIM/ADR/ADR-011-PLC-HIL-Time-Boundary.md`。
