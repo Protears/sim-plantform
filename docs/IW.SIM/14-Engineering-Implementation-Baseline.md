@@ -4,11 +4,21 @@
 
 本文件把 Part02/05/06/07/08/10/11/12 的设计契约收敛为 .NET 10 模块装配基线，作为编码、代码评审、测试和部署的共同入口。它不重新定义领域规则，而是规定：程序集边界、依赖方向、线程模型、端口适配、事务边界、运行时装配和最小可交付切片。
 
+配套实施文档：
+
+- `14-Project-Structure-and-Dependency-Verification.md`
+- `10-Command-Occupancy-Transaction-Implementation.md`
+- `11-Command-Api-SignalR-Delivery-Contract.md`
+- `06-PLC-Feedback-Process-Image-Contract.md`
+- `14-Engineering-Slice-Acceptance-Matrix.md`
+- `ADR/ADR-016-Commit-Then-Publish-Facts.md`
+
 ## 2. 解决方案与程序集边界
 
 ```text
 src/
   Logistics.Simulation.Domain/
+  Logistics.Simulation.Contracts/
   Logistics.Simulation.Application/
   Logistics.Simulation.SimulationKernel/
   Logistics.Simulation.DeviceRuntime/
@@ -23,6 +33,7 @@ tests/
   *.UnitTests/
   *.IntegrationTests/
   *.ContractTests/
+  *.ArchitectureTests/
 ```
 
 依赖规则：
@@ -91,6 +102,7 @@ Kernel + SignalIo + DeviceRuntime + WorldModel + EventStore。验收 PLC/HIL 关
 | 事件 | 业务事件必须包含 RunId、SimTick、CorrelationId、SchemaVersion |
 | 恢复 | Snapshot 必须包含输入游标、运行态版本和 Hash |
 | 测试 | 新设备至少通过 Command/Occupancy/Event/Replay 四类契约测试 |
+| 交付 | Architecture/Contract/Migration/Replay/稳定性门禁全部通过 |
 
 ## 7. 直接工程任务
 
@@ -98,4 +110,6 @@ Kernel + SignalIo + DeviceRuntime + WorldModel + EventStore。验收 PLC/HIL 关
 2. 实现 `ISimulationRuntimeFactory` 组合根。
 3. 为各模块定义 Ports 项目并启用架构测试。
 4. 实现 Kernel 单线程运行器和有界输入通道。
-5. 建立 Slice A/B/C 的 CI 门禁。
+5. 实现命令、Transfer、Outbox 三类事务边界。
+6. 实现 PLC 反馈过程映像提交和版本校验。
+7. 建立 Slice A/B/C 的 CI 门禁。
