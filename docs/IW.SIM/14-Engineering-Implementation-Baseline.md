@@ -2,24 +2,33 @@
 
 ## 1. 目标与适用范围
 
-本文件把 Part02/05/06/07/08/10/11/12 的设计契约收敛为 .NET 10 模块装配基线，作为编码、代码评审、测试和部署的共同入口。它不重新定义领域规则，而是规定：程序集边界、依赖方向、线程模型、端口适配、事务边界、运行时装配和最小可交付切片。
+本文件把 Part02/03/05/06/07/08/10/11/12 的设计契约收敛为 .NET 10 模块装配基线，作为编码、代码评审、测试和部署的共同入口。它规定程序集边界、线程模型、端口适配、事务边界、正式数据模型、运行时装配和最小可交付切片。
 
-本轮新增的实施约束：Kernel 是唯一 `SimTick` 权威；所有异步输入必须经有界入口和 TickBoundary；Snapshot 只能在完整事实提交边界创建；PLC—设备反馈必须可沿 `CycleSequence → CommandId → TransferId → OccupancyVersion → ProcessImageVersion` 追踪。
+本轮新增实施约束：
+
+- Kernel 是唯一 `SimTick` 权威；
+- 所有异步输入必须经有界入口和 TickBoundary；
+- Snapshot 只能在完整事实提交边界创建；
+- PLC—设备反馈必须可沿 `CycleSequence → CommandId → TransferId → OccupancyVersion → ProcessImageVersion` 追踪；
+- Command、Transfer、Lock、Event、Outbox 使用 Part10 正式数据 Schema；
+- Architecture/Contract/Migration/Replay/稳定性测试是发布前强制门禁。
 
 配套实施文档：
 
 - `03-Kernel-Command-Ordering-and-Determinism.md`
 - `03-Kernel-Input-Backpressure-and-Recovery.md`
+- `03-Kernel-Run-Recovery-Protocol.md`
 - `10-Kernel-Snapshot-Consistency-Contract.md`
+- `10-Formal-Operational-Data-Schema.md`
 - `06-PLC-Device-Command-Feedback-Trace.md`
-- `14-Engineering-Task-Slice-D.md`
-- `ADR/ADR-017-Kernel-Is-Only-SimTick-Authority.md`
+- `06-PLC-Feedback-Contract-Test-Matrix.md`
 - `14-Project-Structure-and-Dependency-Verification.md`
-- `10-Command-Occupancy-Transaction-Implementation.md`
-- `11-Command-Api-SignalR-Delivery-Contract.md`
-- `06-PLC-Feedback-Process-Image-Contract.md`
+- `14-Architecture-Contract-Test-Implementation.md`
+- `14-Engineering-Task-Slice-D.md`
 - `14-Engineering-Slice-Acceptance-Matrix.md`
+- `11-Run-Event-Query-and-Replay-Contract.md`
 - `ADR/ADR-016-Commit-Then-Publish-Facts.md`
+- `ADR/ADR-017-Kernel-Is-Only-SimTick-Authority.md`
 
 ## 2. 解决方案与程序集边界
 
@@ -42,6 +51,8 @@ tests/
   *.IntegrationTests/
   *.ContractTests/
   *.ArchitectureTests/
+  *.DataMigrationTests/
+  *.ReplayDeterminismTests/
 ```
 
 依赖规则：
@@ -77,6 +88,7 @@ public sealed record SimulationRuntimeOptions(
 4. 绑定 EventStore、SnapshotStore、InputRecordStore、Outbox。
 5. 启动健康检查和故障升级策略。
 6. 注册 `IInputIngress`、`ISimulationCommandQueue` 和 Snapshot Coordinator，确保所有异步输入与恢复路径经过统一边界。
+7. 注册正式数据迁移检查器，确认 SchemaVersion 与当前运行时兼容。
 
 ## 4. 线程与调度模型
 
@@ -93,8 +105,17 @@ public sealed record SimulationRuntimeOptions(
 - 恢复顺序为：事实校验 → Cursor → World/Device → PLC Image → Scheduler Queue → Replay。
 - 新 Epoch 建立后，旧 Epoch 输入全部拒收。
 - Outbox 发布失败不能回滚已提交事实，也不能重新执行设备动作。
+- Run 事件查询和 SignalR 补发都以 Event Sequence 为游标，不以时间戳分页。
 
-## 6. 最小工程切片
+## 6. 数据迁移与兼容基线
+
+- Migration 必须遵循 Expand → Backfill → Switch → Contract 四阶段。
+- 新增字段先允许 NULL 或默认值，再在数据回填完成后提升约束。
+- 状态枚举扩展必须先兼容读取，再切换写入，避免旧 Worker 无法读取新状态。
+- 破坏性索引和大表变更必须提供回滚方案及窗口评估。
+- 运行时启动前执行 SchemaVersion 校验；不兼容时拒绝进入 Running。
+
+## 7. 最小工程切片
 
 ### Slice A：纯仿真
 
@@ -112,7 +133,11 @@ Kernel + SignalIo + DeviceRuntime + WorldModel + EventStore。验收 PLC/HIL 关
 
 增加确定性排序、背压恢复、Snapshot 一致性和 PLC—设备 Trace。验收不同输入到达顺序下 Replay Hash 一致，并能在故障后恢复至可验证状态。
 
-## 7. 工程质量门禁
+### Slice E：数据与交付闭环
+
+增加正式 PostgreSQL Schema、EF Core Migration、Architecture/Contract/Migration/Replay 测试和 Run Event Query。验收命令、Transfer、Outbox 的事务一致性及断线补发。
+
+## 8. 工程质量门禁
 
 | 门禁 | 规则 |
 |---|---|
@@ -122,12 +147,13 @@ Kernel + SignalIo + DeviceRuntime + WorldModel + EventStore。验收 PLC/HIL 关
 | 持久化 | 领域实体不得直接注入 `DbContext` |
 | 幂等 | 外部命令必须携带 CommandId + RequestHash |
 | 事件 | 业务事件必须包含 RunId、SimTick、CorrelationId、SchemaVersion |
+| 数据 | Command/Transfer/Lock/Outbox 必须符合正式 Schema |
 | 恢复 | Snapshot 必须包含输入游标、运行态版本和 Hash |
 | 反馈 | Transfer 未 Commit 不得回写 CargoAtDestination |
 | 测试 | 新设备至少通过 Command/Occupancy/Event/Replay 四类契约测试 |
 | 交付 | Architecture/Contract/Migration/Replay/稳定性门禁全部通过 |
 
-## 8. 直接工程任务
+## 9. 直接工程任务
 
 1. 创建解决方案和项目依赖检查脚本。
 2. 实现 `ISimulationRuntimeFactory` 组合根。
@@ -135,6 +161,8 @@ Kernel + SignalIo + DeviceRuntime + WorldModel + EventStore。验收 PLC/HIL 关
 4. 实现 Kernel 单线程运行器、有界输入通道和确定性排序器。
 5. 实现命令、Transfer、Outbox 三类事务边界。
 6. 实现 PLC 反馈过程映像提交和版本校验。
-7. 建立 Slice A/B/C/D 的 CI 门禁。
-8. 实现 Snapshot Capture/Restore 和 Replay Hash 校验。
-9. 为 `CycleSequence/CommandId/TransferId/OccupancyVersion/ProcessImageVersion` 建立诊断查询索引。
+7. 建立正式 PostgreSQL Schema 与 EF Core Migration。
+8. 实现 Run Event Query、SignalR 补发和 Replay API。
+9. 建立 Slice A/B/C/D/E 的 CI 门禁。
+10. 实现 Snapshot Capture/Restore 和 Replay Hash 校验。
+11. 为 `CycleSequence/CommandId/TransferId/OccupancyVersion/ProcessImageVersion` 建立诊断查询索引。
