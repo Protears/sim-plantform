@@ -10,25 +10,28 @@
 - 所有异步输入必须经有界入口和 TickBoundary；
 - Snapshot 只能在完整事实提交边界创建；
 - PLC—设备反馈必须可沿 `CycleSequence → CommandId → TransferId → OccupancyVersion → ProcessImageVersion` 追踪；
-- Command、Transfer、Lock、Event、Outbox 使用 Part10 正式数据 Schema；
-- Architecture/Contract/Migration/Replay/稳定性测试是发布前强制门禁。
+- Command、Transfer、Lock、Event、Outbox 使用 Part10 正式数据 Schema v2；
+- Recovery 必须遵循事实校验、Cursor、World/Device、PLC Image、Scheduler、Replay 顺序；
+- Architecture/Contract/Migration/Replay/稳定性测试是发布前强制门禁；
+- Run Event Query、SignalR 补发和 Replay 统一使用 EventSequence 游标。
 
 配套实施文档：
 
 - `03-Kernel-Command-Ordering-and-Determinism.md`
 - `03-Kernel-Input-Backpressure-and-Recovery.md`
-- `03-Kernel-Run-Recovery-Protocol.md`
+- `03-Kernel-Run-Recovery-Protocol-v2.md`
 - `10-Kernel-Snapshot-Consistency-Contract.md`
-- `10-Formal-Operational-Data-Schema.md`
+- `10-Formal-Operational-Schema-v2.md`
 - `06-PLC-Device-Command-Feedback-Trace.md`
-- `06-PLC-Feedback-Contract-Test-Matrix.md`
+- `06-PLC-Feedback-Contract-Test-Matrix-v2.md`
 - `14-Project-Structure-and-Dependency-Verification.md`
-- `14-Architecture-Contract-Test-Implementation.md`
+- `14-Architecture-Contract-Test-Implementation-v2.md`
 - `14-Engineering-Task-Slice-D.md`
 - `14-Engineering-Slice-Acceptance-Matrix.md`
-- `11-Run-Event-Query-and-Replay-Contract.md`
+- `11-Run-Event-Query-and-Replay-Contract-v2.md`
 - `ADR/ADR-016-Commit-Then-Publish-Facts.md`
 - `ADR/ADR-017-Kernel-Is-Only-SimTick-Authority.md`
+- `ADR/ADR-018-Formal-Data-and-Test-Gates.md`
 
 ## 2. 解决方案与程序集边界
 
@@ -89,6 +92,7 @@ public sealed record SimulationRuntimeOptions(
 5. 启动健康检查和故障升级策略。
 6. 注册 `IInputIngress`、`ISimulationCommandQueue` 和 Snapshot Coordinator，确保所有异步输入与恢复路径经过统一边界。
 7. 注册正式数据迁移检查器，确认 SchemaVersion 与当前运行时兼容。
+8. 注册 `IKernelRecoveryCoordinator` 和 `IRunEventReplayService`，禁止外部模块旁路恢复或直接分页事件。
 
 ## 4. 线程与调度模型
 
@@ -106,6 +110,7 @@ public sealed record SimulationRuntimeOptions(
 - 新 Epoch 建立后，旧 Epoch 输入全部拒收。
 - Outbox 发布失败不能回滚已提交事实，也不能重新执行设备动作。
 - Run 事件查询和 SignalR 补发都以 Event Sequence 为游标，不以时间戳分页。
+- Recovery/Replaying 期间不得发布 Completed、CargoTransferCommitted 等对外完成事件。
 
 ## 6. 数据迁移与兼容基线
 
@@ -135,7 +140,7 @@ Kernel + SignalIo + DeviceRuntime + WorldModel + EventStore。验收 PLC/HIL 关
 
 ### Slice E：数据与交付闭环
 
-增加正式 PostgreSQL Schema、EF Core Migration、Architecture/Contract/Migration/Replay 测试和 Run Event Query。验收命令、Transfer、Outbox 的事务一致性及断线补发。
+增加正式 PostgreSQL Schema v2、EF Core Migration、Architecture/Contract/Migration/Replay 测试、Run Event Query 和 SignalR 补发。验收命令、Transfer、Outbox 的事务一致性及断线补发。
 
 ## 8. 工程质量门禁
 
@@ -147,9 +152,10 @@ Kernel + SignalIo + DeviceRuntime + WorldModel + EventStore。验收 PLC/HIL 关
 | 持久化 | 领域实体不得直接注入 `DbContext` |
 | 幂等 | 外部命令必须携带 CommandId + RequestHash |
 | 事件 | 业务事件必须包含 RunId、SimTick、CorrelationId、SchemaVersion |
-| 数据 | Command/Transfer/Lock/Outbox 必须符合正式 Schema |
+| 数据 | Command/Transfer/Lock/Outbox 必须符合正式 Schema v2 |
 | 恢复 | Snapshot 必须包含输入游标、运行态版本和 Hash |
 | 反馈 | Transfer 未 Commit 不得回写 CargoAtDestination |
+| 查询 | Event Query/SignalR/Replay 必须使用 EventSequence 游标 |
 | 测试 | 新设备至少通过 Command/Occupancy/Event/Replay 四类契约测试 |
 | 交付 | Architecture/Contract/Migration/Replay/稳定性门禁全部通过 |
 
@@ -161,8 +167,9 @@ Kernel + SignalIo + DeviceRuntime + WorldModel + EventStore。验收 PLC/HIL 关
 4. 实现 Kernel 单线程运行器、有界输入通道和确定性排序器。
 5. 实现命令、Transfer、Outbox 三类事务边界。
 6. 实现 PLC 反馈过程映像提交和版本校验。
-7. 建立正式 PostgreSQL Schema 与 EF Core Migration。
+7. 建立正式 PostgreSQL Schema v2 与 EF Core Migration。
 8. 实现 Run Event Query、SignalR 补发和 Replay API。
 9. 建立 Slice A/B/C/D/E 的 CI 门禁。
 10. 实现 Snapshot Capture/Restore 和 Replay Hash 校验。
 11. 为 `CycleSequence/CommandId/TransferId/OccupancyVersion/ProcessImageVersion` 建立诊断查询索引。
+12. 建立 Recovery/Replay 运行态操作审计，确保恢复期间禁止对外完成事件。
