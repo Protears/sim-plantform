@@ -13,25 +13,37 @@
 - Command、Transfer、Lock、Event、Outbox 使用 Part10 正式数据 Schema v2；
 - Recovery 必须遵循事实校验、Cursor、World/Device、PLC Image、Scheduler、Replay 顺序；
 - Architecture/Contract/Migration/Replay/稳定性测试是发布前强制门禁；
-- Run Event Query、SignalR 补发和 Replay 统一使用 EventSequence 游标。
+- Run Event Query、SignalR 补发和 Replay 统一使用 EventSequence 游标；
+- RunProfile 在运行前必须完成 SchemaVersion、MappingHash、Capability、ProtocolProfile 校验并冻结；
+- Run 运维操作统一经 `IRunLifecycleCoordinator`，使用 `OperationId + ExpectedStateVersion` 保证幂等和并发一致性；
+- Operational Audit 是运维动作权威，Telemetry 不得用于推断业务事实；
+- Trace 必须能够沿 `CycleSequence → CommandId → TransferId → OccupancyVersion → ProcessImageVersion → EventSequence` 反查完整链路；
+- 发布前必须提供配置摘要、Schema 版本、Recovery/Replay Hash、Trace 抽样和审计摘要组成的证据包。
 
 配套实施文档：
 
 - `03-Kernel-Command-Ordering-and-Determinism.md`
 - `03-Kernel-Input-Backpressure-and-Recovery.md`
 - `03-Kernel-Run-Recovery-Protocol-v2.md`
+- `03-Run-Lifecycle-and-Operational-Command-State-Machine.md`
 - `10-Kernel-Snapshot-Consistency-Contract.md`
 - `10-Formal-Operational-Schema-v2.md`
+- `10-Run-Audit-and-Operational-Trace-Schema.md`
 - `06-PLC-Device-Command-Feedback-Trace.md`
 - `06-PLC-Feedback-Contract-Test-Matrix-v2.md`
 - `14-Project-Structure-and-Dependency-Verification.md`
 - `14-Architecture-Contract-Test-Implementation-v2.md`
 - `14-Engineering-Task-Slice-D.md`
 - `14-Engineering-Slice-Acceptance-Matrix.md`
+- `14-Run-Profile-and-Configuration-Schema.md`
+- `14-Operational-Readiness-and-Release-Gates.md`
 - `11-Run-Event-Query-and-Replay-Contract-v2.md`
+- `11-Trace-Query-and-Operations-Api-Contract.md`
 - `ADR/ADR-016-Commit-Then-Publish-Facts.md`
 - `ADR/ADR-017-Kernel-Is-Only-SimTick-Authority.md`
 - `ADR/ADR-018-Formal-Data-and-Test-Gates.md`
+- `ADR/ADR-019-Recovery-And-Event-Cursor-Authority.md`
+- `ADR/ADR-020-Run-Configuration-and-Operational-Trace-Authority.md`
 
 ## 2. 解决方案与程序集边界
 
@@ -93,13 +105,15 @@ public sealed record SimulationRuntimeOptions(
 6. 注册 `IInputIngress`、`ISimulationCommandQueue` 和 Snapshot Coordinator，确保所有异步输入与恢复路径经过统一边界。
 7. 注册正式数据迁移检查器，确认 SchemaVersion 与当前运行时兼容。
 8. 注册 `IKernelRecoveryCoordinator` 和 `IRunEventReplayService`，禁止外部模块旁路恢复或直接分页事件。
+9. 注册 `IRunLifecycleCoordinator`、`IOperationalAuditStore` 和 Trace Query 组件，确保运维命令、审计和业务链路使用统一入口。
+10. 将 Profile 冻结摘要、Schema 版本、MappingHash 和 Capability 清单写入 Run 初始化事实。
 
 ## 4. 线程与调度模型
 
 - Kernel 主循环是唯一推进 SimTick 的线程。
 - PLC 逻辑、设备状态演化和 Occupancy Commit 必须在 Kernel 调度上下文内完成；异步 I/O 只能投递输入事件，不得直接改变领域状态。
 - Communication/HIL 使用独立 I/O 线程或 async socket，但通过有界 Channel 将数据交给 InputIngress。
-- Snapshot/Outbox 持久化为后台消费者；持久化延迟不能阻塞 Kernel，但必须提供 `PersistenceLag` 和降级门槛。
+- Snapshot/Outbox/Audit 持久化为后台消费者；持久化延迟不能阻塞 Kernel，但必须提供 `PersistenceLag` 和降级门槛。
 - 同一 Run 的业务事件按 `(SimTick, Phase, Priority, SourceId, LocalSequence)` 排序；不得依赖线程完成顺序。
 
 ## 5. 一致性与恢复基线
@@ -111,6 +125,7 @@ public sealed record SimulationRuntimeOptions(
 - Outbox 发布失败不能回滚已提交事实，也不能重新执行设备动作。
 - Run 事件查询和 SignalR 补发都以 Event Sequence 为游标，不以时间戳分页。
 - Recovery/Replaying 期间不得发布 Completed、CargoTransferCommitted 等对外完成事件。
+- RunProfile 在 Recovery/Replay 中视为 Frozen，只能读取，不能热更新确定性字段。
 
 ## 6. 数据迁移与兼容基线
 
@@ -119,6 +134,7 @@ public sealed record SimulationRuntimeOptions(
 - 状态枚举扩展必须先兼容读取，再切换写入，避免旧 Worker 无法读取新状态。
 - 破坏性索引和大表变更必须提供回滚方案及窗口评估。
 - 运行时启动前执行 SchemaVersion 校验；不兼容时拒绝进入 Running。
+- Operational Audit 仅追加写；Audit/Trace 表不得被业务清理任务直接物理删除。
 
 ## 7. 最小工程切片
 
@@ -142,6 +158,10 @@ Kernel + SignalIo + DeviceRuntime + WorldModel + EventStore。验收 PLC/HIL 关
 
 增加正式 PostgreSQL Schema v2、EF Core Migration、Architecture/Contract/Migration/Replay 测试、Run Event Query 和 SignalR 补发。验收命令、Transfer、Outbox 的事务一致性及断线补发。
 
+### Slice F：运行治理闭环
+
+增加 RunProfile Schema、Run 生命周期运维命令、Operational Audit、Trace Query 和 Operational Readiness 门禁。验收配置冻结、运维命令幂等、审计完整、Trace 可追踪、故障证据包可生成。
+
 ## 8. 工程质量门禁
 
 | 门禁 | 规则 |
@@ -150,14 +170,17 @@ Kernel + SignalIo + DeviceRuntime + WorldModel + EventStore。验收 PLC/HIL 关
 | 时间 | 领域代码不得调用 `DateTime.UtcNow` 决定业务结果 |
 | 调度 | 只有 Kernel 可以推进 `SimTick` |
 | 持久化 | 领域实体不得直接注入 `DbContext` |
-| 幂等 | 外部命令必须携带 CommandId + RequestHash |
+| 幂等 | 外部命令必须携带 CommandId + RequestHash；运维命令必须携带 OperationId + ExpectedStateVersion |
 | 事件 | 业务事件必须包含 RunId、SimTick、CorrelationId、SchemaVersion |
 | 数据 | Command/Transfer/Lock/Outbox 必须符合正式 Schema v2 |
 | 恢复 | Snapshot 必须包含输入游标、运行态版本和 Hash |
 | 反馈 | Transfer 未 Commit 不得回写 CargoAtDestination |
 | 查询 | Event Query/SignalR/Replay 必须使用 EventSequence 游标 |
+| 配置 | RunProfile 必须冻结，确定性字段禁止热更新 |
+| 审计 | Recovery/Replay/ManualOverride/ConfigRejected 必须有追加审计 |
+| Trace | 关键链路节点缺失必须显式返回不完整 |
 | 测试 | 新设备至少通过 Command/Occupancy/Event/Replay 四类契约测试 |
-| 交付 | Architecture/Contract/Migration/Replay/稳定性门禁全部通过 |
+| 交付 | Architecture/Contract/Migration/Replay/稳定性/Operational Readiness 门禁全部通过 |
 
 ## 9. 直接工程任务
 
@@ -169,7 +192,10 @@ Kernel + SignalIo + DeviceRuntime + WorldModel + EventStore。验收 PLC/HIL 关
 6. 实现 PLC 反馈过程映像提交和版本校验。
 7. 建立正式 PostgreSQL Schema v2 与 EF Core Migration。
 8. 实现 Run Event Query、SignalR 补发和 Replay API。
-9. 建立 Slice A/B/C/D/E 的 CI 门禁。
+9. 建立 Slice A/B/C/D/E/F 的 CI 门禁。
 10. 实现 Snapshot Capture/Restore 和 Replay Hash 校验。
 11. 为 `CycleSequence/CommandId/TransferId/OccupancyVersion/ProcessImageVersion` 建立诊断查询索引。
 12. 建立 Recovery/Replay 运行态操作审计，确保恢复期间禁止对外完成事件。
+13. 实现 RunProfile Schema 校验、配置冻结和热更新拒绝。
+14. 实现 `IRunLifecycleCoordinator`、`IOperationalAuditStore` 和 Trace Query。
+15. 生成发布证据包：配置摘要、Schema 版本、测试结果、Recovery/Replay Hash、Trace 抽样和审计摘要。
