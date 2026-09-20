@@ -18,7 +18,11 @@
 - Run 运维操作统一经 `IRunLifecycleCoordinator`，使用 `OperationId + ExpectedStateVersion` 保证幂等和并发一致性；
 - Operational Audit 是运维动作权威，Telemetry 不得用于推断业务事实；
 - Trace 必须能够沿 `CycleSequence → CommandId → TransferId → OccupancyVersion → ProcessImageVersion → EventSequence` 反查完整链路；
-- 发布前必须提供配置摘要、Schema 版本、Recovery/Replay Hash、Trace 抽样和审计摘要组成的证据包。
+- 发布前必须提供配置摘要、Schema 版本、Recovery/Replay Hash、Trace 抽样和审计摘要组成的证据包；
+- Device Runtime、PLC Mapper、Signal IO、Recovery、Replay 必须读取同一个不可变 `DeviceBindingSnapshot`；
+- Definition、Configuration、Capability、PointMapping、ControllerProfile 的规范化摘要必须生成 `DeviceConfigHash/MappingHash`，运行中不得热更新确定性字段；
+- 设备实例必须经过 `Defined → Bound → Initializing → Ready` 才能接收普通命令；
+- 设备模型装配和点位映射测试是进入 PLC/HIL 联调的前置门禁。
 
 配套实施文档：
 
@@ -26,6 +30,10 @@
 - `03-Kernel-Input-Backpressure-and-Recovery.md`
 - `03-Kernel-Run-Recovery-Protocol-v2.md`
 - `03-Run-Lifecycle-and-Operational-Command-State-Machine.md`
+- `05-Device-Definition-and-Instance-Binding.md`
+- `05-Device-Configuration-Schema.md`
+- `05-Device-Instance-Lifecycle-and-Health.md`
+- `06-Device-Capability-and-Point-Mapping-Contract.md`
 - `10-Kernel-Snapshot-Consistency-Contract.md`
 - `10-Formal-Operational-Schema-v2.md`
 - `10-Run-Audit-and-Operational-Trace-Schema.md`
@@ -35,6 +43,7 @@
 - `14-Architecture-Contract-Test-Implementation-v2.md`
 - `14-Engineering-Task-Slice-D.md`
 - `14-Engineering-Slice-Acceptance-Matrix.md`
+- `14-Device-Model-Commissioning-Test-Matrix.md`
 - `14-Run-Profile-and-Configuration-Schema.md`
 - `14-Operational-Readiness-and-Release-Gates.md`
 - `11-Run-Event-Query-and-Replay-Contract-v2.md`
@@ -44,6 +53,7 @@
 - `ADR/ADR-018-Formal-Data-and-Test-Gates.md`
 - `ADR/ADR-019-Recovery-And-Event-Cursor-Authority.md`
 - `ADR/ADR-020-Run-Configuration-and-Operational-Trace-Authority.md`
+- `ADR/ADR-021-Device-Binding-Snapshot-Authority.md`
 
 ## 2. 解决方案与程序集边界
 
@@ -78,6 +88,7 @@ tests/
 - Communication/Hil 只能通过 Ports 向 Application/SignalIo 提供帧和信号；禁止直接写 World State。
 - Data 实现 Application/Domain 定义的 Store 接口；EF Core 只出现在 Data。
 - Api/Worker 负责组合根和生命周期，不在控制器中执行设备算法。
+- DeviceRuntime 不得读取可变配置源；只能读取 `DeviceBindingSnapshot`。
 
 ## 3. 组合根与运行时装配
 
@@ -107,6 +118,8 @@ public sealed record SimulationRuntimeOptions(
 8. 注册 `IKernelRecoveryCoordinator` 和 `IRunEventReplayService`，禁止外部模块旁路恢复或直接分页事件。
 9. 注册 `IRunLifecycleCoordinator`、`IOperationalAuditStore` 和 Trace Query 组件，确保运维命令、审计和业务链路使用统一入口。
 10. 将 Profile 冻结摘要、Schema 版本、MappingHash 和 Capability 清单写入 Run 初始化事实。
+11. 解析 Definition/Configuration/Capability/PointMapping/ControllerProfile 并生成 `DeviceBindingSnapshot`。
+12. 运行前执行设备模型装配、点位映射、健康初始状态和 Snapshot Hash 校验。
 
 ## 4. 线程与调度模型
 
@@ -126,6 +139,7 @@ public sealed record SimulationRuntimeOptions(
 - Run 事件查询和 SignalR 补发都以 Event Sequence 为游标，不以时间戳分页。
 - Recovery/Replaying 期间不得发布 Completed、CargoTransferCommitted 等对外完成事件。
 - RunProfile 在 Recovery/Replay 中视为 Frozen，只能读取，不能热更新确定性字段。
+- Device Runtime 恢复必须先校验 `DeviceBindingSnapshotId/MappingHash`，不匹配时进入 Failed，不得尝试使用当前最新配置继续恢复。
 
 ## 6. 数据迁移与兼容基线
 
@@ -135,6 +149,7 @@ public sealed record SimulationRuntimeOptions(
 - 破坏性索引和大表变更必须提供回滚方案及窗口评估。
 - 运行时启动前执行 SchemaVersion 校验；不兼容时拒绝进入 Running。
 - Operational Audit 仅追加写；Audit/Trace 表不得被业务清理任务直接物理删除。
+- DeviceBindingSnapshot、DeviceConfigHash、MappingHash 必须写入 Run 初始化事实；缺失时禁止进入 Ready。
 
 ## 7. 最小工程切片
 
@@ -162,6 +177,10 @@ Kernel + SignalIo + DeviceRuntime + WorldModel + EventStore。验收 PLC/HIL 关
 
 增加 RunProfile Schema、Run 生命周期运维命令、Operational Audit、Trace Query 和 Operational Readiness 门禁。验收配置冻结、运维命令幂等、审计完整、Trace 可追踪、故障证据包可生成。
 
+### Slice G：设备模型与装配闭环
+
+增加 DeviceDefinition Registry、DeviceInstance Binder、Capability/PointMapping Validator、DeviceBindingSnapshot 和 Device Health Coordinator。验收设备实例可复现装配、映射哈希稳定、设备健康状态正确、Recovery/Replay 使用同一 BindingSnapshot。
+
 ## 8. 工程质量门禁
 
 | 门禁 | 规则 |
@@ -179,8 +198,10 @@ Kernel + SignalIo + DeviceRuntime + WorldModel + EventStore。验收 PLC/HIL 关
 | 配置 | RunProfile 必须冻结，确定性字段禁止热更新 |
 | 审计 | Recovery/Replay/ManualOverride/ConfigRejected 必须有追加审计 |
 | Trace | 关键链路节点缺失必须显式返回不完整 |
-| 测试 | 新设备至少通过 Command/Occupancy/Event/Replay 四类契约测试 |
-| 交付 | Architecture/Contract/Migration/Replay/稳定性/Operational Readiness 门禁全部通过 |
+| 设备装配 | Definition/Config/Capability/PointMapping/ControllerProfile 必须生成一致 BindingSnapshot |
+| 健康 | 未 Ready 或处于 Degraded/Recovering 的设备不得执行普通命令 |
+| 测试 | 新设备至少通过 Command/Occupancy/Event/Replay/Binding 五类契约测试 |
+| 交付 | Architecture/Contract/Migration/Replay/稳定性/Operational Readiness/Device Model 门禁全部通过 |
 
 ## 9. 直接工程任务
 
@@ -192,10 +213,12 @@ Kernel + SignalIo + DeviceRuntime + WorldModel + EventStore。验收 PLC/HIL 关
 6. 实现 PLC 反馈过程映像提交和版本校验。
 7. 建立正式 PostgreSQL Schema v2 与 EF Core Migration。
 8. 实现 Run Event Query、SignalR 补发和 Replay API。
-9. 建立 Slice A/B/C/D/E/F 的 CI 门禁。
+9. 建立 Slice A/B/C/D/E/F/G 的 CI 门禁。
 10. 实现 Snapshot Capture/Restore 和 Replay Hash 校验。
 11. 为 `CycleSequence/CommandId/TransferId/OccupancyVersion/ProcessImageVersion` 建立诊断查询索引。
 12. 建立 Recovery/Replay 运行态操作审计，确保恢复期间禁止对外完成事件。
 13. 实现 RunProfile Schema 校验、配置冻结和热更新拒绝。
 14. 实现 `IRunLifecycleCoordinator`、`IOperationalAuditStore` 和 Trace Query。
 15. 生成发布证据包：配置摘要、Schema 版本、测试结果、Recovery/Replay Hash、Trace 抽样和审计摘要。
+16. 实现 `IDeviceDefinitionRegistry`、`IDeviceInstanceBinder` 和 BindingSnapshot 持久化。
+17. 实现 Capability/PointMapping Validator、Device Health Coordinator 和 DM-001～DM-012 测试。
